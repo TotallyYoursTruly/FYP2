@@ -1,7 +1,5 @@
 // Windows-compatible PCAP router integrated with routing simulation
 
-// Windows-compatible PCAP router integrated with routing simulation
-
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -53,6 +51,9 @@ struct Device {
     int neighbor_count;
 
     FILE* pcap_out;
+
+    int packet_received;
+    int packet_written;
 };
 
 uint32_t ip_to_uint(const char* ip_str) {
@@ -88,7 +89,12 @@ void init_device(Device* dev, const char* name, const char* pcap_filename) {
         return;
     }
 
-    PcapGlobalHeader hdr = {
+    dev->packet_received = 0;
+    dev->packet_written = 0;
+
+
+    // simulate tcpdump header for wireshark compatibility
+    PcapGlobalHeader hdr = { 
         .magic_number = 0xa1b2c3d4,
         .version_major = 2,
         .version_minor = 4,
@@ -163,12 +169,14 @@ int owns_address(Device* dev, const char* ip) {
 }
 
 void forward_packet(Device* dev, const char* src_ip, const char* dst_ip, const uint8_t* full_pkt, size_t pkt_size) {
-    printf("[%s] Packet from %s to %s\n", dev->name, src_ip, dst_ip);
+    //printf("[%s] Packet from %s to %s\n", dev->name, src_ip, dst_ip);
+    dev->packet_received++;
 
     if (owns_address(dev, dst_ip)) {
-        printf("[%s] Packet reached destination. Writing to PCAP.\n", dev->name);
+        //printf("[%s] Packet reached destination. Writing to PCAP.\n", dev->name);
         if (dev->pcap_out)
             fwrite(full_pkt, 1, pkt_size, dev->pcap_out);
+        dev->packet_written++;
         return;
     }
 
@@ -179,7 +187,7 @@ void forward_packet(Device* dev, const char* src_ip, const char* dst_ip, const u
             Interface* out_iface = dev->routes[i].netif;
             for (int j = 0; j < dev->neighbor_count; j++) {
                 if (dev->neighbors[j].iface == out_iface) {
-                    printf("[%s] Forwarding to %s\n", dev->name, dev->neighbors[j].neighbor->name);
+                    //printf("[%s] Forwarding to %s\n", dev->name, dev->neighbors[j].neighbor->name);
                     forward_packet(dev->neighbors[j].neighbor, src_ip, dst_ip, full_pkt, pkt_size);
                     return;
                 }
@@ -192,7 +200,7 @@ void forward_packet(Device* dev, const char* src_ip, const char* dst_ip, const u
     printf("[%s] Dropped: No route to %s\n", dev->name, dst_ip);
 }
 
-void process_pcap(const char* input_pcap, Device* ingress_dev) {
+void process_pcap(const char* input_pcap, Device* input_dev) {
     typedef struct {
         uint32_t magic;
         uint16_t ver_major;
@@ -211,7 +219,7 @@ void process_pcap(const char* input_pcap, Device* ingress_dev) {
     } PacketHeader;
 
     FILE* f = fopen(input_pcap, "rb");
-    if (!f) { printf("Failed to open source PCAP\n"); return; }
+    if (!f) { printf("Failed to open PCAP\n"); return; }
 
     PcapHeader pcap_hdr;
     fread(&pcap_hdr, sizeof(pcap_hdr), 1, f);
@@ -240,7 +248,7 @@ void process_pcap(const char* input_pcap, Device* ingress_dev) {
         memcpy(full_packet, &pkt_hdr, sizeof(pkt_hdr));
         memcpy(full_packet + sizeof(pkt_hdr), buffer, pkt_hdr.incl_len);
 
-        forward_packet(ingress_dev, src_ip, dst_ip, full_packet, sizeof(pkt_hdr) + pkt_hdr.incl_len);
+        forward_packet(input_dev, src_ip, dst_ip, full_packet, sizeof(pkt_hdr) + pkt_hdr.incl_len);
         packet_count++;
     }
 
@@ -254,48 +262,116 @@ void process_pcap(const char* input_pcap, Device* ingress_dev) {
     fclose(f);
 }
 
+void show_stats(Device* dev, double total_seconds) {
+    printf("\n--- Stats for %s ---\n", dev->name);
+    printf("Packets received: %d\n", dev->packet_received);
+    printf("Packets written to .pcap (reached destination): %d\n", dev->packet_written);
+    printf("Pps (Packets per second): %.2f Pps\n", dev->packet_received / total_seconds);
+}
 
+void forward_packet_no_pcap(Device* dev, const char* src_ip, const char* dst_ip) {
+    printf("[%s] Packet from %s to %s\n", dev->name, src_ip, dst_ip);
+    dev->packet_received++;
 
+    if (owns_address(dev, dst_ip)) {
+        printf("[%s] Packet reached destination. \n", dev->name);
+        return;
+    }
+
+    uint32_t dst = ip_to_uint(dst_ip);
+    for (int i = 0; i < dev->route_count; i++) {
+        uint32_t net = ip_to_uint(dev->routes[i].network);
+        if (prefix_match(dst, net, dev->routes[i].prefix_len)) {
+            Interface* out_iface = dev->routes[i].netif;
+            for (int j = 0; j < dev->neighbor_count; j++) {
+                if (dev->neighbors[j].iface == out_iface) {
+                    printf("[%s] Forwarding to %s\n", dev->name, dev->neighbors[j].neighbor->name);
+                    forward_packet_no_pcap(dev->neighbors[j].neighbor, src_ip, dst_ip);
+                    return;
+                }
+            }
+            printf("[%s] No neighbor connected on %s\n", dev->name, out_iface->name);
+            return;
+        }
+    }
+
+    printf("[%s] Dropped: No route to %s\n", dev->name, dst_ip);
+}
 
 
 int main() {
-    Device A, B, C;
-    init_device(&A, "Juniper", "Juniper_out.pcap");
-    init_device(&B, "Cisco", "Cisco_out.pcap");
-    init_device(&C, "Satellite", "Satellite_out.pcap");
 
-    // Add interfaces (must match routing table order)
-    add_interface(&A, "eth0", "192.168.1.1"); // for 164.0.0.0/8 → Cisco
-    add_interface(&A, "eth1", "192.168.2.1"); // for 214.0.0.0/8 → Satellite
+    char inPcap[30];
+
+    
+    printf("Enter Packet File: ");
+    scanf("%s", inPcap);
+    
+    LARGE_INTEGER freq, start, end;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&start);
+
+    Device A, B, C, D;
+    init_device(&A, "Juniper", "./pcap_device/juniper_out.pcap");
+    init_device(&B, "Cisco", "./pcap_device/cisco_out.pcap");
+    init_device(&C, "Satellite", "./pcap_device/satellite_out.pcap");
+    init_device(&D, "Internet", "./pcap_device/internet_out.pcap");
+
+    add_interface(&A, "eth0", "192.168.1.1");
+    add_interface(&A, "eth1", "192.168.2.1");
+    add_interface(&A, "eth2", "192.168.5.1");  
 
     add_interface(&B, "eth0", "192.168.1.2");
-    add_interface(&B, "eth1", "192.168.3.1");
-
     add_interface(&C, "eth0", "192.168.2.2");
-    add_interface(&C, "eth1", "192.168.4.1");
+    add_interface(&D, "eth0", "192.168.5.2");
 
-    // Add neighbors (must match interfaces!)
-    add_neighbor(&A, "eth0", &B);  // A → B on eth0
-    add_neighbor(&A, "eth1", &C);  // A → C on eth1
+    add_neighbor(&A, "eth0", &B);
+    add_neighbor(&A, "eth1", &C);
+    add_neighbor(&A, "eth2", &D);  
 
-    add_neighbor(&B, "eth0", &A);  // B → A on eth0
+    add_neighbor(&B, "eth0", &A);
+    add_neighbor(&C, "eth0", &A);
+    add_neighbor(&D, "eth0", &A);  
 
-    add_neighbor(&C, "eth0", &A);  // C → A on eth0
+    load_routes(&A, "./routes_device/routes_A.txt");
+    load_routes(&B, "./routes_device/routes_B.txt");
+    load_routes(&C, "./routes_device/routes_C.txt");
+    load_routes(&D, "./routes_device/routes_D.txt");  
 
-    // Load routing tables (must match interface order in device setup!)
-    load_routes(&A, "routes_A.txt");
-    load_routes(&B, "routes_B.txt");
-    load_routes(&C, "routes_C.txt");
+    load_owned(&B, "./owned_device/owned_B.txt");
+    load_owned(&C, "./owned_device/owned_C.txt");
+    load_owned(&D, "./owned_device/owned_D.txt");  
 
-    // Load owned IPs (needed for destination ownership check)
-    load_owned(&B, "owned_B.txt"); // Should own 164.0.0.0/8
-    load_owned(&C, "owned_C.txt"); // Should own 214.0.0.0/8
 
-    printf("\n=== Processing source.pcap ===\n");
-    process_pcap("166_2_all.pcap", &A);
+  
+
+    printf("\n=== Processing pcap ===\n");
+
+    //debug test
+    /*
+    forward_packet_no_pcap(&A, "166.0.1.1", "164.8.8.8");
+    forward_packet_no_pcap(&A, "166.0.1.1", "214.8.8.8");
+    forward_packet_no_pcap(&A, "166.0.1.1", "8.8.8.8");
+    forward_packet_no_pcap(&A, "197.0.1.1", "148.8.8.8");
+    */
+    process_pcap(inPcap, &A);
+
+    QueryPerformanceCounter(&end);
+    double total_seconds = (double)(end.QuadPart - start.QuadPart) / freq.QuadPart;
+
+    show_stats(&A, total_seconds);
+    show_stats(&B, total_seconds);
+    show_stats(&C, total_seconds);
+
+    show_stats(&D, total_seconds);
+
 
     fclose(A.pcap_out);
     fclose(B.pcap_out);
     fclose(C.pcap_out);
+    fclose(D.pcap_out);
+
+
+
     return 0;
 }
